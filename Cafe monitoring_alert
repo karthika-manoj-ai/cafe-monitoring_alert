@@ -1,0 +1,115 @@
+import cv2
+import time
+import threading
+from collections import deque
+from ultralytics import YOLO
+from gtts import gTTS
+from playsound import playsound
+import os
+import winsound
+
+# =============================
+# CONFIG
+# =============================
+CAMERA_ID = 0
+OVER_CROWD_LIMIT = 2
+SMOOTHING_WINDOW = 5
+CONF_THRESHOLD = 0.4
+ALERT_REPEAT_INTERVAL = 5  # seconds
+
+BEEP_FREQ = 1000
+BEEP_DURATION = 500
+AUDIO_FILE = "alert.mp3"
+
+# =============================
+# LOAD YOLO
+# =============================
+print("Loading YOLO...")
+model = YOLO("yolov8n.pt")
+print("YOLO loaded")
+
+# =============================
+# PRE-GENERATE AUDIO (IMPORTANT)
+# =============================
+if not os.path.exists(AUDIO_FILE):
+    tts = gTTS("Alert. The cafe is overcrowded.", lang="en")
+    tts.save(AUDIO_FILE)
+
+# =============================
+# ALERT THREAD CONTROL
+# =============================
+alert_active = False
+alert_thread_running = False
+
+def alert_loop():
+    global alert_thread_running
+    alert_thread_running = True
+
+    while alert_active:
+        winsound.Beep(BEEP_FREQ, BEEP_DURATION)
+        playsound(AUDIO_FILE)
+        time.sleep(ALERT_REPEAT_INTERVAL)
+
+    alert_thread_running = False
+
+# =============================
+# CAMERA
+# =============================
+cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW)
+cap.set(3, 640)
+cap.set(4, 480)
+
+# =============================
+# STATE
+# =============================
+raw_counts = deque(maxlen=SMOOTHING_WINDOW)
+alert_message = "🟢 Status: Normal"
+
+# =============================
+# MAIN LOOP
+# =============================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model(frame, conf=CONF_THRESHOLD, verbose=False)
+
+    count = 0
+    for r in results:
+        for box in r.boxes:
+            if int(box.cls[0]) == 0:
+                count += 1
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+
+    raw_counts.append(count)
+    people_count = round(sum(raw_counts) / len(raw_counts))
+
+    if people_count > OVER_CROWD_LIMIT:
+        alert_message = "🔴 ALERT: Overcrowded"
+        alert_active = True
+
+        if not alert_thread_running:
+            threading.Thread(target=alert_loop, daemon=True).start()
+    else:
+        alert_message = "🟢 Status: Normal"
+        alert_active = False
+
+    cv2.putText(frame, "Cafe Monitoring", (20,30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+    cv2.putText(frame, f"People Count: {people_count}", (20,65),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
+
+    cv2.putText(frame, alert_message, (20,105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                (0,0,255) if "ALERT" in alert_message else (0,255,0), 2)
+
+    cv2.imshow("YOLO Overcrowding Monitor", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
