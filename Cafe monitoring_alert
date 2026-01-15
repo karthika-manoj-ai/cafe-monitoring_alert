@@ -1,9 +1,4 @@
-import cv2
-import time
-import threading
-import os
-import torch
-import winsound
+import cv2, time, threading, os, torch, winsound
 from collections import deque
 from ultralytics import YOLO
 from gtts import gTTS
@@ -11,195 +6,125 @@ from playsound import playsound
 from PIL import Image
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
-# =============================
-# CONFIG
-# =============================
+# ================= CONFIG =================
 CAMERA_ID = 0
 OVER_CROWD_LIMIT = 2
-SMOOTHING_WINDOW = 5
 CONF_THRESHOLD = 0.4
+SMOOTHING_WINDOW = 5
+VLM_CHECK_INTERVAL = 6
 ALERT_REPEAT_INTERVAL = 5
-VLM_CHECK_INTERVAL = 5   # seconds
 
-BEEP_FREQ = 1000
-BEEP_DURATION = 500
+FRAME_W, FRAME_H = 640, 480
+YOLO_W, YOLO_H = 416, 416
+
+BEEP_FREQ, BEEP_DURATION = 1000, 400
 AUDIO_FILE = "alert.mp3"
 
-# =============================
-# LOAD YOLO
-# =============================
-print("Loading YOLO...")
-yolo_model = YOLO("yolov8n.pt")
-print("YOLO loaded")
-
-# =============================
-# LOAD QWEN2-VL (CPU SAFE)
-# =============================
-print("Loading Qwen2-VL (CPU mode)...")
+# ================= MODELS =================
+yolo = YOLO("yolov8n.pt")
 
 vl_model = Qwen2VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2-VL-2B-Instruct",
     torch_dtype=torch.float32
-).to("cpu")
+).to("cpu").eval()
 
 vl_processor = AutoProcessor.from_pretrained(
-    "Qwen/Qwen2-VL-2B-Instruct",
-    use_fast=False
+    "Qwen/Qwen2-VL-2B-Instruct", use_fast=False
 )
 
-print("Qwen2-VL loaded")
-
-# =============================
-# PRE-GENERATE AUDIO
-# =============================
+# ================= AUDIO =================
 if not os.path.exists(AUDIO_FILE):
-    tts = gTTS("Alert. The cafe is overcrowded.", lang="en")
-    tts.save(AUDIO_FILE)
+    gTTS("Alert. The cafe is overcrowded.", lang="en").save(AUDIO_FILE)
 
-# =============================
-# ALERT THREAD CONTROL
-# =============================
-alert_active = False
-alert_thread_running = False
+alert_active, vlm_busy, vlm_ok = False, False, False
+last_vlm_time = 0
+counts = deque(maxlen=SMOOTHING_WINDOW)
+lock = threading.Lock()
 
+# ================= FUNCTIONS =================
 def alert_loop():
-    global alert_thread_running
-    alert_thread_running = True
-    while alert_active:
+    while True:
+        with lock:
+            if not alert_active:
+                break
         winsound.Beep(BEEP_FREQ, BEEP_DURATION)
         playsound(AUDIO_FILE)
         time.sleep(ALERT_REPEAT_INTERVAL)
-    alert_thread_running = False
 
-# =============================
-# VLM ASYNC STATE
-# =============================
-vlm_busy = False
-vlm_result = False
-last_vlm_check = 0
-
-# =============================
-# QWEN2-VL CONFIRM FUNCTION
-# =============================
-def qwen_confirm_overcrowding(frame):
-    image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-    messages = [{
+def qwen_check(frame):
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    msg = [{
         "role": "user",
-        "content": [
-            {"type": "image"},
-            {"type": "text",
-             "text": (
-                 "Look at this cafe image. "
-                 "Are there too many people causing overcrowding? "
-                 "Answer only Yes or No."
-             )}
-        ]
+        "content": [{"type": "image"},
+                    {"type": "text", "text": "Is this cafe overcrowded? Answer Yes or No."}]
     }]
-
-    prompt = vl_processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True
-    )
-
-    inputs = vl_processor(
-        text=prompt,
-        images=image,
-        return_tensors="pt"
-    )
-
+    prompt = vl_processor.apply_chat_template(msg, add_generation_prompt=True)
+    inp = vl_processor(text=prompt, images=img, return_tensors="pt")
     with torch.no_grad():
-        output = vl_model.generate(**inputs, max_new_tokens=10)
+        out = vl_model.generate(**inp, max_new_tokens=6)
+    return "yes" in vl_processor.decode(out[0], skip_special_tokens=True).lower()
 
-    answer = vl_processor.decode(output[0], skip_special_tokens=True)
-    return "yes" in answer.lower()
-
-# =============================
-# ASYNC VLM WORKER
-# =============================
-def run_vlm_async(frame):
-    global vlm_busy, vlm_result
+def run_vlm(frame):
+    global vlm_busy, vlm_ok
     vlm_busy = True
-
-    # 🔹 Downscale for speed
-    small = cv2.resize(frame, (320, 240))
-    vlm_result = qwen_confirm_overcrowding(small)
-
+    vlm_ok = qwen_check(cv2.resize(frame, (320, 240)))
     vlm_busy = False
 
-# =============================
-# CAMERA
-# =============================
+# ================= CAMERA =================
 cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW)
-cap.set(3, 640)
-cap.set(4, 480)
+cap.set(3, FRAME_W)
+cap.set(4, FRAME_H)
 
-# =============================
-# STATE
-# =============================
-raw_counts = deque(maxlen=SMOOTHING_WINDOW)
-alert_message = "🟢 Status: Normal"
-
-# =============================
-# MAIN LOOP
-# =============================
+# ================= MAIN LOOP =================
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # -------- YOLO DETECTION --------
-    results = yolo_model(frame, conf=CONF_THRESHOLD, verbose=False)
+    yolo_frame = cv2.resize(frame, (YOLO_W, YOLO_H))
+    results = yolo(yolo_frame, conf=CONF_THRESHOLD, verbose=False)
 
     count = 0
     for r in results:
-        for box in r.boxes:
-            if int(box.cls[0]) == 0:
+        for b in r.boxes:
+            if int(b.cls[0]) == 0:
                 count += 1
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(frame, (x1, y1), (x2, y2),
-                              (0, 255, 0), 2)
+                x1, y1, x2, y2 = b.xyxy[0]
+                x1, x2 = int(x1 * FRAME_W / YOLO_W), int(x2 * FRAME_W / YOLO_W)
+                y1, y2 = int(y1 * FRAME_H / YOLO_H), int(y2 * FRAME_H / YOLO_H)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    raw_counts.append(count)
-    people_count = round(sum(raw_counts) / len(raw_counts))
+    counts.append(count)
+    people = round(sum(counts) / len(counts))
     now = time.time()
+    status = "🟢 Status: Normal"
 
-    # -------- VLM TRIGGER (NON-BLOCKING) --------
-    if people_count > OVER_CROWD_LIMIT:
-        if not vlm_busy and (now - last_vlm_check) > VLM_CHECK_INTERVAL:
-            last_vlm_check = now
-            threading.Thread(
-                target=run_vlm_async,
-                args=(frame.copy(),),
-                daemon=True
-            ).start()
+    if people > OVER_CROWD_LIMIT:
+        if not vlm_busy and now - last_vlm_time > VLM_CHECK_INTERVAL:
+            last_vlm_time = now
+            threading.Thread(target=run_vlm, args=(frame.copy(),), daemon=True).start()
 
-        if vlm_result:
-            alert_message = "🔴 ALERT: Overcrowded (VLM Confirmed)"
-            alert_active = True
-            if not alert_thread_running:
-                threading.Thread(target=alert_loop, daemon=True).start()
+        if vlm_ok:
+            status = "🔴 ALERT: Overcrowded"
+            with lock:
+                if not alert_active:
+                    alert_active = True
+                    threading.Thread(target=alert_loop, daemon=True).start()
         else:
-            alert_message = "🟡 Crowded but acceptable"
+            status = "🟡 Crowded (checking)"
             alert_active = False
     else:
-        alert_message = "🟢 Status: Normal"
+        vlm_ok = False
         alert_active = False
-        vlm_result = False
 
-    # -------- UI --------
-    cv2.putText(frame, "Cafe Monitoring (YOLO + Qwen2-VL)", (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-    cv2.putText(frame, f"People Count: {people_count}", (20, 65),
+    # UI
+    cv2.putText(frame, f"People: {people}", (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-    cv2.putText(frame, alert_message, (20, 105),
+    cv2.putText(frame, status, (20, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (0, 0, 255) if "ALERT" in alert_message else (0, 255, 0), 2)
+                (0, 0, 255) if "ALERT" in status else (0, 255, 0), 2)
 
-    cv2.imshow("YOLO + Qwen2-VL Overcrowding Monitor", frame)
-
+    cv2.imshow("YOLO + Qwen2-VL Monitor", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
